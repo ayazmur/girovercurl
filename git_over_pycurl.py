@@ -204,19 +204,19 @@ class GitOverPyCurl:
 
         try:
             c.setopt(c.URL, url)
+
+            # === НАСТРОЙКА ПРОКСИ (КАК В РАБОЧЕМ КОДЕ) ===
             c.setopt(c.PROXY, self.proxy_url)
             c.setopt(c.PROXYPORT, self.proxy_port)
-
-            # ===== АВТОРИЗАЦИЯ НА ПРОКСИ =====
-            # Если прокси требует логин/пароль — укажите здесь
-            # Формат: "username:password"
             c.setopt(c.PROXYUSERPWD, ":")  # Пустые логин и пароль
             c.setopt(c.PROXYAUTH, pycurl.HTTPAUTH_ANY)
             c.setopt(c.HTTPPROXYTUNNEL, 1)
 
-            c.setopt(c.SSL_VERIFYPEER, 0)
-            c.setopt(c.SSL_VERIFYHOST, 0)
+            # === ОТКЛЮЧАЕМ SSL ПРОВЕРКУ (РЕШЕНИЕ ПРОБЛЕМЫ С СЕРТИФИКАТАМИ) ===
+            c.setopt(c.SSL_VERIFYPEER, 0)  # <-- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ
+            c.setopt(c.SSL_VERIFYHOST, 0)  # <-- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ
 
+            # Заголовки
             headers = [
                 "Accept: application/vnd.github.v3+json",
                 "Content-Type: application/json",
@@ -227,6 +227,7 @@ class GitOverPyCurl:
 
             c.setopt(c.HTTPHEADER, headers)
 
+            # Метод
             method = method.upper()
             if method == "GET":
                 c.setopt(c.HTTPGET, 1)
@@ -244,8 +245,9 @@ class GitOverPyCurl:
                     c.setopt(c.POSTFIELDS, json.dumps(data))
 
             c.setopt(c.WRITEDATA, buf)
-            c.setopt(c.TIMEOUT, 120)  # Увеличил таймаут
+            c.setopt(c.TIMEOUT, 120)
             c.setopt(c.CONNECTTIMEOUT, 60)
+            c.setopt(c.NOPROGRESS, 0)
 
             c.perform()
 
@@ -256,8 +258,8 @@ class GitOverPyCurl:
                 raise Exception(f"API Error {http_code}: {response[:200]}")
 
             return json.loads(response) if response else {}
+
         except pycurl.error as e:
-            # Расшифровка ошибок pycurl
             error_code, error_msg = e.args
             raise Exception(f"PycURL error {error_code}: {error_msg}")
         except Exception as e:
@@ -267,7 +269,6 @@ class GitOverPyCurl:
                 c.close()
             except:
                 pass
-
     def push_files(self, files: List[Tuple[str, str]], commit_message: str, branch: Optional[str] = None) -> bool:
         try:
             if self.owner == "unknown":
