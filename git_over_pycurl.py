@@ -1,897 +1,812 @@
 #!/usr/bin/env python3
-"""
-GitShell - Неубиваемая оболочка для Git через pycurl
-С поддержкой цветов в Windows
+"""git-over-pycurl: a local HTTP proxy that tunnels Git traffic through a
+corporate proxy using pycurl (libcurl).
+
+The tool listens on 127.0.0.1 and speaks the normal HTTP proxy protocol that
+Git already understands.  HTTPS requests (CONNECT) become raw byte tunnels
+that libcurl establishes through the upstream proxy, so TLS stays end-to-end
+between Git and the remote server and native git commands work unchanged.
+
+Commands:
+    run        start the local proxy (default)
+    install    point git at the local proxy
+    uninstall  remove git proxy settings
+    test       run connectivity checks
+    status     show effective configuration
 """
 
-import os
-import sys
-import json
-import subprocess
-import shutil
-import re
-import base64
+from __future__ import annotations
+
+import argparse
 import io
+import json
+import logging
+import os
+import socket
+import socketserver
+import ssl
+import subprocess
+import sys
+import threading
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
-import traceback
+from urllib.parse import quote, urlsplit
 
-# ============================================================
-# ВКЛЮЧАЕМ ЦВЕТА В WINDOWS
-# ============================================================
-
-if sys.platform == 'win32':
-    try:
-        import ctypes
-
-        kernel32 = ctypes.windll.kernel32
-        # Включаем виртуальный терминал для ANSI-цветов
-        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
-        mode = ctypes.c_uint()
-        kernel32.GetConsoleMode(handle, ctypes.byref(mode))
-        mode.value |= 0x0004  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
-        kernel32.SetConsoleMode(handle, mode)
-    except:
-        pass
-
-
-# ============================================================
-# ЦВЕТА
-# ============================================================
-
-class Colors:
-    HEADER = '\033[95m'
-    BLUE = '\033[94m'
-    CYAN = '\033[96m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    RED = '\033[91m'
-    BOLD = '\033[1m'
-    DIM = '\033[2m'
-    END = '\033[0m'
-
-    @staticmethod
-    def strip(text):
-        """Удаляет ANSI-коды из текста (для логов)"""
-        import re
-        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-        return ansi_escape.sub('', text)
-
-
-# ============================================================
-# БЕЗОПАСНЫЙ ИМПОРТ МОДУЛЕЙ
-# ============================================================
-
-READLINE_AVAILABLE = False
-try:
-    import readline
-
-    READLINE_AVAILABLE = True
-except ImportError:
-    try:
-        import pyreadline3 as readline
-
-        READLINE_AVAILABLE = True
-    except:
-        pass
-
-PYCURL_AVAILABLE = False
 try:
     import pycurl
-    import certifi
+except ImportError:
+    pycurl = None
 
-    PYCURL_AVAILABLE = True
-except:
+APP_NAME = "git-over-pycurl"
+VERSION = "2.0.0"
+CONFIG_PATH = Path.home() / ".gitproxy.json"
+LOG = logging.getLogger("gitproxy")
+
+DEFAULT_CONFIG = {
+    "upstream_proxy": "http://rnt-proxy.rn-t.ru:3128",
+    "listen_host": "127.0.0.1",
+    "listen_port": 3129,
+    "proxy_user": "",
+    "connect_timeout": 30,
+    "idle_timeout": 600,
+    "verify_upstream": False,
+}
+
+REASONS = {
+    400: "Bad Request",
+    431: "Request Header Fields Too Large",
+    502: "Bad Gateway",
+}
+
+
+class TunnelError(Exception):
     pass
 
-REGISTRY_AVAILABLE = False
-try:
-    import winreg
 
-    REGISTRY_AVAILABLE = True
-except:
+class ProtocolError(Exception):
     pass
 
 
-# ============================================================
-# РАБОТА С РЕЕСТРОМ
-# ============================================================
-
-def save_token_to_registry(token: str) -> bool:
-    if not REGISTRY_AVAILABLE:
-        return False
-    try:
-        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"SOFTWARE\GitShell")
-        winreg.SetValueEx(key, "GitHubToken", 0, winreg.REG_SZ, token)
-        winreg.CloseKey(key)
-        return True
-    except:
-        return False
+def _prog() -> str:
+    return Path(sys.argv[0]).name
 
 
-def load_token_from_registry() -> Optional[str]:
-    if not REGISTRY_AVAILABLE:
-        return None
-    try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"SOFTWARE\GitShell", 0, winreg.KEY_READ)
-        token, _ = winreg.QueryValueEx(key, "GitHubToken")
-        winreg.CloseKey(key)
-        return token
-    except:
-        return None
+def build_proxy_url(config: dict) -> str:
+    proxy = str(config.get("upstream_proxy", "")).strip()
+    if "://" not in proxy:
+        proxy = "http://" + proxy
+    user = str(config.get("proxy_user") or "")
+    if user:
+        parts = urlsplit(proxy)
+        host = parts.hostname or parts.netloc
+        netloc = f"{host}:{parts.port}" if parts.port else host
+        proxy = f"{parts.scheme or 'http'}://{quote(user, safe=':')}@{netloc}"
+    return proxy
 
 
-def delete_token_from_registry() -> bool:
-    if not REGISTRY_AVAILABLE:
-        return False
-    try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"SOFTWARE\GitShell", 0, winreg.KEY_SET_VALUE)
-        winreg.DeleteValue(key, "GitHubToken")
-        winreg.CloseKey(key)
-        return True
-    except:
-        return False
-
-
-# ============================================================
-# КОНФИГУРАЦИЯ
-# ============================================================
-
-CONFIG_FILE = Path.home() / ".gitshell-config.json"
-HISTORY_FILE = Path.home() / ".gitshell-history"
-
-
-# ============================================================
-# GIT OVER PYCURL
-# ============================================================
-
-class GitOverPyCurl:
-    def __init__(self, repo_path: str, github_token: str):
-        self.repo_path = Path(repo_path)
-        self.github_token = github_token
-        self.api_base = "https://api.github.com"
-        self.proxy_url = "http://rnt-proxy.rn-t.ru"
-        self.proxy_port = 3128
-        self.owner = "unknown"
-        self.repo_name = "unknown"
-        self._parse_remote_url()
-
-    def _parse_remote_url(self):
+def split_host_port(value: str, default_port: int):
+    if value.startswith("["):
+        end = value.find("]")
+        if end == -1:
+            return None, None
+        host = value[1:end]
+        rest = value[end + 1:]
+        if rest.startswith(":"):
+            try:
+                return host, int(rest[1:])
+            except ValueError:
+                return None, None
+        return host, default_port
+    if ":" in value:
+        host, _, port_text = value.rpartition(":")
         try:
-            result = subprocess.run(
-                ["git", "remote", "get-url", "origin"],
-                cwd=self.repo_path,
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            url = result.stdout.strip()
-            if "github.com" in url:
-                if "://" in url:
-                    match = re.search(r"github\.com[:/](.+?)(?:\.git)?$", url)
-                else:
-                    match = re.search(r"github\.com:(.+?)(?:\.git)?$", url)
-                if match:
-                    parts = match.group(1).split('/')
-                    if len(parts) >= 2:
-                        self.owner = parts[0]
-                        self.repo_name = parts[1]
-        except:
+            return host, int(port_text)
+        except ValueError:
+            return value, default_port
+    return value, default_port
+
+
+def _safe_close(curl) -> None:
+    try:
+        curl.close()
+    except Exception:
+        pass
+
+
+def _dup_curl_socket(curl):
+    raw = None
+    for name in ("ACTIVESOCKET", "LASTSOCKET"):
+        const = getattr(pycurl, name, None)
+        if const is None:
+            continue
+        try:
+            raw = curl.getinfo(const)
+        except Exception:
+            raw = None
+        if isinstance(raw, socket.socket) or (isinstance(raw, int) and raw >= 0):
+            break
+        raw = None
+    if isinstance(raw, socket.socket):
+        return raw.dup()
+    if isinstance(raw, int) and raw >= 0:
+        wrapper = None
+        try:
+            wrapper = socket.socket(fileno=raw)
+            duplicate = wrapper.dup()
+        except OSError:
+            return None
+        finally:
+            if wrapper is not None:
+                try:
+                    wrapper.detach()
+                except Exception:
+                    pass
+        return duplicate
+    return None
+
+
+class Tunnel:
+    """Owns a pycurl handle plus the raw connected socket it established."""
+
+    def __init__(self, curl, sock):
+        self._curl = curl
+        self.sock = sock
+
+    def sendall(self, data):
+        self.sock.sendall(data)
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
             pass
+        _safe_close(self._curl)
 
-    def get_current_branch(self) -> str:
+
+def open_tunnel(config: dict, host: str, port: int) -> Tunnel:
+    """Open a raw TCP tunnel to host:port through the upstream proxy."""
+    if pycurl is None:
+        raise TunnelError("pycurl is not installed (pip install pycurl)")
+
+    proxy_url = build_proxy_url(config)
+    if "://" not in proxy_url:
+        proxy_url = "http://" + proxy_url
+    scheme = urlsplit(proxy_url).scheme or "http"
+    timeout = int(config.get("connect_timeout", 30))
+
+    curl = pycurl.Curl()
+    try:
+        curl.setopt(pycurl.URL, f"https://{host}:{port}/")
+        curl.setopt(pycurl.PROXY, proxy_url)
+        curl.setopt(pycurl.PROXYAUTH, pycurl.HTTPAUTH_ANY)
+        curl.setopt(pycurl.HTTPPROXYTUNNEL, 1)
+        curl.setopt(pycurl.CONNECT_ONLY, 1)
+        curl.setopt(pycurl.NOPROGRESS, 1)
+        curl.setopt(pycurl.CONNECTTIMEOUT, timeout)
+        curl.setopt(pycurl.TIMEOUT, timeout)
+        curl.setopt(pycurl.SSL_VERIFYPEER, 0)
+        curl.setopt(pycurl.SSL_VERIFYHOST, 0)
+
+        proxy_type = getattr(pycurl, "PROXYTYPE_HTTP", None)
+        if scheme == "https":
+            proxy_type = getattr(pycurl, "PROXYTYPE_HTTPS", proxy_type)
+        if proxy_type is not None:
+            curl.setopt(pycurl.PROXYTYPE, proxy_type)
+
+        curl.perform()
+
+        sock = _dup_curl_socket(curl)
+        if sock is None:
+            raise TunnelError("pycurl did not expose the tunnel socket; upgrade pycurl")
+        sock.settimeout(None)
+        return Tunnel(curl, sock)
+    except pycurl.error as exc:
+        _safe_close(curl)
+        raise TunnelError(str(exc)) from exc
+    except Exception:
+        _safe_close(curl)
+        raise
+
+
+class BufferedSocket:
+    def __init__(self, sock):
+        self.sock = sock
+        self.buffer = bytearray()
+
+    def readline(self, limit: int = 65536) -> bytes:
+        while b"\n" not in self.buffer:
+            if len(self.buffer) > limit:
+                raise ProtocolError("header line too long")
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                if not self.buffer:
+                    return b""
+                break
+            self.buffer.extend(chunk)
+        index = self.buffer.find(b"\n")
+        if index == -1:
+            line = bytes(self.buffer)
+            self.buffer.clear()
+            return line
+        line = bytes(self.buffer[: index + 1])
+        del self.buffer[: index + 1]
+        return line
+
+    def read_headers(self, limit: int = 65536) -> list:
+        headers = []
+        total = 0
+        while True:
+            line = self.readline()
+            if not line:
+                break
+            total += len(line)
+            if total > limit:
+                raise ProtocolError("request headers too large")
+            headers.append(line)
+            if line in (b"\r\n", b"\n"):
+                break
+        return headers
+
+    def pending(self) -> bytes:
+        data = bytes(self.buffer)
+        self.buffer.clear()
+        return data
+
+
+def relay(client: socket.socket, upstream: socket.socket, idle_timeout: int = 600) -> None:
+    client.settimeout(idle_timeout)
+    upstream.settimeout(idle_timeout)
+
+    def pipe(src, dst):
         try:
-            result = subprocess.run(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                cwd=self.repo_path,
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            if result.returncode == 0:
-                return result.stdout.strip()
-        except:
+            while True:
+                data = src.recv(65536)
+                if not data:
+                    break
+                dst.sendall(data)
+        except OSError:
             pass
-        return "main"
-
-    def _make_request(self, method: str, endpoint: str, data: Optional[Dict] = None) -> Dict:
-        if not PYCURL_AVAILABLE:
-            raise Exception("pycurl не доступен")
-
-        url = f"{self.api_base}{endpoint}"
-        buf = io.BytesIO()
-        c = pycurl.Curl()
-
-        try:
-            c.setopt(c.URL, url)
-
-            # === НАСТРОЙКА ПРОКСИ (КАК В РАБОЧЕМ КОДЕ) ===
-            c.setopt(c.PROXY, self.proxy_url)
-            c.setopt(c.PROXYPORT, self.proxy_port)
-            c.setopt(c.PROXYUSERPWD, ":")  # Пустые логин и пароль
-            c.setopt(c.PROXYAUTH, pycurl.HTTPAUTH_ANY)
-            c.setopt(c.HTTPPROXYTUNNEL, 1)
-
-            # === ОТКЛЮЧАЕМ SSL ПРОВЕРКУ (РЕШЕНИЕ ПРОБЛЕМЫ С СЕРТИФИКАТАМИ) ===
-            c.setopt(c.SSL_VERIFYPEER, 0)  # <-- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ
-            c.setopt(c.SSL_VERIFYHOST, 0)  # <-- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ
-
-            # Заголовки
-            headers = [
-                "Accept: application/vnd.github.v3+json",
-                "Content-Type: application/json",
-                "User-Agent: GitShell/1.0"
-            ]
-            if self.github_token:
-                headers.append(f"Authorization: token {self.github_token}")
-
-            c.setopt(c.HTTPHEADER, headers)
-
-            # Метод
-            method = method.upper()
-            if method == "GET":
-                c.setopt(c.HTTPGET, 1)
-            elif method == "POST":
-                c.setopt(c.POST, 1)
-                if data:
-                    c.setopt(c.POSTFIELDS, json.dumps(data))
-            elif method == "PUT":
-                c.setopt(c.CUSTOMREQUEST, "PUT")
-                if data:
-                    c.setopt(c.POSTFIELDS, json.dumps(data))
-            elif method == "PATCH":
-                c.setopt(c.CUSTOMREQUEST, "PATCH")
-                if data:
-                    c.setopt(c.POSTFIELDS, json.dumps(data))
-
-            c.setopt(c.WRITEDATA, buf)
-            c.setopt(c.TIMEOUT, 120)
-            c.setopt(c.CONNECTTIMEOUT, 60)
-            c.setopt(c.NOPROGRESS, 0)
-
-            c.perform()
-
-            http_code = c.getinfo(c.RESPONSE_CODE)
-            response = buf.getvalue().decode("utf-8")
-
-            if http_code >= 400:
-                raise Exception(f"API Error {http_code}: {response[:200]}")
-
-            return json.loads(response) if response else {}
-
-        except pycurl.error as e:
-            error_code, error_msg = e.args
-            raise Exception(f"PycURL error {error_code}: {error_msg}")
-        except Exception as e:
-            raise Exception(f"Request failed: {e}")
         finally:
             try:
-                c.close()
-            except:
+                dst.shutdown(socket.SHUT_WR)
+            except OSError:
                 pass
-    def push_files(self, files: List[Tuple[str, str]], commit_message: str, branch: Optional[str] = None) -> bool:
+
+    forward = threading.Thread(target=pipe, args=(client, upstream), daemon=True)
+    backward = threading.Thread(target=pipe, args=(upstream, client), daemon=True)
+    forward.start()
+    backward.start()
+    forward.join()
+    backward.join()
+
+
+class ProxyHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        client = self.request
+        client.settimeout(60)
+        reader = BufferedSocket(client)
         try:
-            if self.owner == "unknown":
-                raise Exception("Не удалось определить репозиторий")
-
-            branch = branch or self.get_current_branch()
-
-            ref_info = self._make_request("GET", f"/repos/{self.owner}/{self.repo_name}/git/refs/heads/{branch}")
-            latest_commit_sha = ref_info["object"]["sha"]
-
-            commit_info = self._make_request("GET", f"/repos/{self.owner}/{self.repo_name}/commits/{latest_commit_sha}")
-            tree_sha = commit_info["commit"]["tree"]["sha"]
-            tree_info = self._make_request("GET",
-                                           f"/repos/{self.owner}/{self.repo_name}/git/trees/{tree_sha}?recursive=1")
-
-            file_map = {}
-            for file_path, content in files:
-                encoded = base64.b64encode(content.encode("utf-8")).decode("utf-8")
-                blob = self._make_request(
-                    "POST",
-                    f"/repos/{self.owner}/{self.repo_name}/git/blobs",
-                    data={"content": encoded, "encoding": "base64"}
-                )
-                file_map[file_path] = blob["sha"]
-
-            tree_items = []
-            existing = {item["path"]: item for item in tree_info.get("tree", [])}
-
-            for file_path, blob_sha in file_map.items():
-                if file_path in existing:
-                    tree_items.append({
-                        "path": file_path,
-                        "mode": existing[file_path].get("mode", "100644"),
-                        "type": "blob",
-                        "sha": blob_sha
-                    })
-                else:
-                    tree_items.append({
-                        "path": file_path,
-                        "mode": "100644",
-                        "type": "blob",
-                        "sha": blob_sha
-                    })
-
-            for path, item in existing.items():
-                if path not in file_map:
-                    tree_items.append({
-                        "path": path,
-                        "mode": item.get("mode", "100644"),
-                        "type": item["type"],
-                        "sha": item["sha"]
-                    })
-
-            new_tree = self._make_request(
-                "POST",
-                f"/repos/{self.owner}/{self.repo_name}/git/trees",
-                data={"tree": tree_items, "base_tree": tree_sha}
-            )
-
-            new_commit = self._make_request(
-                "POST",
-                f"/repos/{self.owner}/{self.repo_name}/git/commits",
-                data={"message": commit_message, "tree": new_tree["sha"], "parents": [latest_commit_sha]}
-            )
-
-            self._make_request(
-                "PATCH",
-                f"/repos/{self.owner}/{self.repo_name}/git/refs/heads/{branch}",
-                data={"sha": new_commit["sha"], "force": False}
-            )
-
-            return True
-        except Exception as e:
-            raise Exception(f"Push failed: {e}")
-
-
-# ============================================================
-# ОСНОВНОЙ КЛАСС GitShell
-# ============================================================
-
-class GitShell:
-    def __init__(self):
-        self.current_path = Path.cwd()
-        self.token = None
-        self.git_client = None
-        self.alias = {}
-        self.running = True
-
-        self._safe_load_token()
-        self._safe_load_config()
-        self._safe_setup_history()
-
-    def _safe_load_token(self):
+            request_line = reader.readline()
+        except OSError:
+            return
+        if not request_line:
+            return
         try:
-            token = load_token_from_registry()
-            if token:
-                self.token = token
-                return
-        except:
-            pass
+            method, target, version = request_line.decode("latin-1").split()
+        except ValueError:
+            self._send_error(client, 400, "Malformed request line")
+            return
 
         try:
-            if CONFIG_FILE.exists():
-                config = json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
-                token = config.get("github_token")
-                if token:
-                    self.token = token
-                    save_token_to_registry(token)
-                    return
-        except:
-            pass
+            headers = reader.read_headers()
+        except (ProtocolError, OSError) as exc:
+            self._send_error(client, 431, str(exc))
+            return
 
-    def _safe_load_config(self):
-        try:
-            if CONFIG_FILE.exists():
-                config = json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
-                self.alias = config.get("alias", {})
-        except:
-            pass
-
-    def _safe_setup_history(self):
-        try:
-            if READLINE_AVAILABLE:
-                readline.set_history_length(1000)
-                if HISTORY_FILE.exists():
-                    readline.read_history_file(HISTORY_FILE)
-        except:
-            pass
-
-    def _safe_save_history(self):
-        try:
-            if READLINE_AVAILABLE:
-                readline.write_history_file(HISTORY_FILE)
-        except:
-            pass
-
-    def _safe_get_input(self, prompt: str) -> str:
-        try:
-            return input(prompt)
-        except KeyboardInterrupt:
-            raise
-        except:
-            return ""
-
-    def _safe_run_git(self, args: List[str]) -> Tuple[int, str, str]:
-        try:
-            result = subprocess.run(
-                ["git"] + args,
-                cwd=self.current_path,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            return result.returncode, result.stdout, result.stderr
-        except subprocess.TimeoutExpired:
-            return 1, "", "Timeout"
-        except Exception as e:
-            return 1, "", str(e)
-
-    def _safe_get_branch(self) -> str:
-        try:
-            if (self.current_path / ".git").exists():
-                result = subprocess.run(
-                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                    cwd=self.current_path,
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                if result.returncode == 0:
-                    return result.stdout.strip()
-        except:
-            pass
-        return ""
-
-    def _safe_get_status(self) -> bool:
-        try:
-            if (self.current_path / ".git").exists():
-                result = subprocess.run(
-                    ["git", "status", "--porcelain"],
-                    cwd=self.current_path,
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                return bool(result.stdout.strip())
-        except:
-            pass
-        return False
-
-    def _safe_get_prompt(self) -> str:
-        try:
-            branch = self._safe_get_branch()
-            if branch:
-                branch_part = f"{Colors.GREEN}{branch}{Colors.END}"
-            else:
-                branch_part = f"{Colors.BLUE}no-repo{Colors.END}"
-
-            path = str(self.current_path)
-            home = str(Path.home())
-            if path.startswith(home):
-                path = "~" + path[len(home):]
-
-            if len(path) > 40:
-                parts = path.split(os.sep)
-                if len(parts) > 3:
-                    path = os.sep.join(["..." + parts[0][:2], *parts[-3:]])
-
-            changes = f"{Colors.YELLOW}*{Colors.END}" if self._safe_get_status() else ""
-
-            return f"{Colors.CYAN}❯ {Colors.BOLD}{branch_part}{Colors.END} {Colors.DIM}{path}{Colors.END}{changes} {Colors.CYAN}${Colors.END} "
-        except:
-            return f"{Colors.CYAN}❯ error {Colors.CYAN}${Colors.END} "
-
-    def _cmd_cd(self, args):
-        try:
-            if len(args) > 1:
-                new_path = Path(args[1])
-                if not new_path.is_absolute():
-                    new_path = self.current_path / new_path
-                if new_path.exists() and new_path.is_dir():
-                    self.current_path = new_path.resolve()
-                    self.git_client = None
-                else:
-                    print(f"{Colors.RED}❌ Папка не найдена{Colors.END}")
-            else:
-                self.current_path = Path.home()
-                self.git_client = None
-        except Exception as e:
-            print(f"{Colors.RED}❌ Ошибка cd: {e}{Colors.END}")
-
-    def _cmd_pwd(self, args):
-        try:
-            print(self.current_path)
-        except Exception as e:
-            print(f"{Colors.RED}❌ Ошибка: {e}{Colors.END}")
-
-    def _cmd_ls(self, args):
-        try:
-            items = sorted(self.current_path.iterdir())
-            for item in items:
-                if item.is_dir():
-                    print(f"{Colors.BLUE}{item.name}/{Colors.END}")
-                else:
-                    print(item.name)
-        except Exception as e:
-            print(f"{Colors.RED}❌ Ошибка ls: {e}{Colors.END}")
-
-    def _cmd_config(self, args):
-        try:
-            if len(args) > 1:
-                if args[1] == "token":
-                    if len(args) > 2:
-                        self.token = args[2]
-                        save_token_to_registry(self.token)
-                        self.git_client = None
-                        print(f"{Colors.GREEN}✅ Токен сохранен в реестр{Colors.END}")
-                    else:
-                        print(f"🔑 Токен: {self.token[:10] + '...' if self.token else 'Не установлен'}")
-                elif args[1] == "delete-token":
-                    if delete_token_from_registry():
-                        self.token = None
-                        print(f"{Colors.GREEN}✅ Токен удален{Colors.END}")
-                    else:
-                        print(f"{Colors.RED}❌ Ошибка удаления{Colors.END}")
-                else:
-                    print(
-                        f"{Colors.RED}❌ Неизвестная опция. Используйте: config token <токен> | config delete-token{Colors.END}")
-            else:
-                print(f"{Colors.YELLOW}📋 Конфигурация:{Colors.END}")
-                print(f"  Токен: {self.token[:10] + '...' if self.token else 'Не установлен'}")
-                print(f"  Токен сохранен в: реестр Windows (HKCU\\SOFTWARE\\GitShell)")
-                print(f"  Git: {'✅' if shutil.which('git') else '❌'}")
-                print(f"  PyCurl: {'✅' if PYCURL_AVAILABLE else '❌'}")
-                print(f"  Автодополнение: {'✅' if READLINE_AVAILABLE else '❌'}")
-        except Exception as e:
-            print(f"{Colors.RED}❌ Ошибка config: {e}{Colors.END}")
-
-    def _cmd_push(self, args):
-        try:
-            if not self.token:
-                print(f"{Colors.RED}❌ Токен не настроен. Используйте: config token <токен>{Colors.END}")
-                return
-
-            if not PYCURL_AVAILABLE:
-                print(f"{Colors.RED}❌ PyCurl не доступен{Colors.END}")
-                return
-
-            if not (self.current_path / ".git").exists():
-                print(f"{Colors.RED}❌ Не в Git репозитории{Colors.END}")
-                return
-
-            branch = args[1] if len(args) > 1 else self._safe_get_branch()
-            if not branch:
-                branch = "master"
-
-            # Проверяем, есть ли изменения
-            status_result = subprocess.run(
-                ["git", "status", "--porcelain"],
-                cwd=self.current_path,
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-
-            changed_files = []
-            for line in status_result.stdout.strip().split("\n"):
-                if line:
-                    parts = line.split()
-                    if len(parts) >= 2 and not line.startswith("??"):
-                        changed_files.append(parts[1])
-
-            if changed_files:
-                print(f"{Colors.YELLOW}⚠️ Есть незакоммиченные изменения:{Colors.END}")
-                for f in changed_files[:5]:
-                    print(f"  {f}")
-                if len(changed_files) > 5:
-                    print(f"  ... и еще {len(changed_files) - 5} файлов")
-
-                answer = input("Закоммитить их перед пушем? (y/n): ").strip().lower()
-                if answer == 'y':
-                    msg = input("Сообщение коммита: ").strip()
-                    if not msg:
-                        msg = "Update via GitShell"
-                    subprocess.run(["git", "add", "."], cwd=self.current_path, capture_output=True)
-                    subprocess.run(["git", "commit", "-m", msg], cwd=self.current_path, capture_output=True)
-                    print(f"{Colors.GREEN}✅ Коммит создан{Colors.END}")
-                else:
-                    print("ℹ️ Пуш отменен")
-                    return
-
-            # Получаем последний коммит
-            commit_hash = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=self.current_path,
-                capture_output=True,
-                text=True,
-                timeout=10
-            ).stdout.strip()
-
-            if not commit_hash:
-                print("❌ Нет коммитов для пуша")
-                return
-
-            # Получаем файлы в последнем коммите
-            diff_result = subprocess.run(
-                ["git", "diff", "--name-only", f"{commit_hash}~1", commit_hash],
-                cwd=self.current_path,
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-
-            files_to_push = []
-            for file_path in diff_result.stdout.strip().split("\n"):
-                if file_path:
-                    full_path = self.current_path / file_path
-                    if full_path.exists():
-                        try:
-                            content = full_path.read_text(encoding='utf-8')
-                            files_to_push.append((file_path, content))
-                        except:
-                            pass
-
-            if not files_to_push:
-                for file_path in changed_files:
-                    full_path = self.current_path / file_path
-                    if full_path.exists():
-                        try:
-                            content = full_path.read_text(encoding='utf-8')
-                            files_to_push.append((file_path, content))
-                        except:
-                            pass
-
-            if not files_to_push:
-                print("❌ Нет файлов для пуша")
-                return
-
-            commit_msg = subprocess.run(
-                ["git", "log", "-1", "--pretty=%B"],
-                cwd=self.current_path,
-                capture_output=True,
-                text=True,
-                timeout=10
-            ).stdout.strip()
-
-            if not commit_msg:
-                commit_msg = "Update via GitShell"
-
-            if not self.git_client:
-                self.git_client = GitOverPyCurl(str(self.current_path), self.token)
-
-            # ПРОВЕРКА: существует ли ветка на удаленном репозитории
-            try:
-                # Пытаемся получить информацию о ветке
-                ref_info = self.git_client._make_request(
-                    "GET",
-                    f"/repos/{self.git_client.owner}/{self.git_client.repo_name}/git/refs/heads/{branch}"
-                )
-                branch_exists = True
-            except Exception as e:
-                if "409" in str(e) or "Not Found" in str(e):
-                    branch_exists = False
-                    print(f"{Colors.YELLOW}⚠️ Репозиторий пустой или ветка {branch} не существует{Colors.END}")
-                    print(f"   Создаю первый коммит...")
-                else:
-                    raise
-
-            # Если репозиторий пустой — сначала создаем ветку
-            if not branch_exists:
-                try:
-                    # Создаем референс для ветки прямо через API
-                    self.git_client._make_request(
-                        "POST",
-                        f"/repos/{self.git_client.owner}/{self.git_client.repo_name}/git/refs",
-                        data={
-                            "ref": f"refs/heads/{branch}",
-                            "sha": commit_hash
-                        }
-                    )
-                    print(f"{Colors.GREEN}✅ Ветка {branch} создана на GitHub{Colors.END}")
-
-                    # Теперь можно пушить файлы
-                    print(f"📤 Отправка {len(files_to_push)} файлов через pycurl...")
-                    success = self.git_client.push_files(
-                        files_to_push,
-                        commit_msg,
-                        branch
-                    )
-
-                    if success:
-                        print(f"{Colors.GREEN}✅ Пуш выполнен!{Colors.END}")
-                    else:
-                        print(f"{Colors.RED}❌ Ошибка пуша через pycurl{Colors.END}")
-
-                except Exception as e:
-                    print(f"{Colors.RED}❌ Ошибка создания ветки: {e}{Colors.END}")
-                    return
-            else:
-                # Ветка существует — обычный пуш
-                print(f"📤 Отправка {len(files_to_push)} файлов через pycurl...")
-                success = self.git_client.push_files(
-                    files_to_push,
-                    commit_msg,
-                    branch
-                )
-
-                if success:
-                    print(f"{Colors.GREEN}✅ Пуш выполнен!{Colors.END}")
-                else:
-                    print(f"{Colors.RED}❌ Ошибка пуша через pycurl{Colors.END}")
-
-        except Exception as e:
-            print(f"{Colors.RED}❌ Ошибка push: {e}{Colors.END}")
-    def _cmd_help(self, args):
-        help_text = f"""
-{Colors.BOLD}{Colors.HEADER}GitShell - Помощь{Colors.END}
-
-{Colors.BOLD}Навигация:{Colors.END}
-  cd <папка>     - Перейти в папку
-  pwd            - Показать текущую папку
-  ls             - Показать содержимое папки
-
-{Colors.BOLD}Git через pycurl:{Colors.END}
-  push [ветка]   - Отправить изменения через pycurl
-
-{Colors.BOLD}Настройка:{Colors.END}
-  config token <токен>  - Установить GitHub токен
-  config delete-token   - Удалить токен
-  config                - Показать конфигурацию
-  alias <имя> <команда> - Создать сокращение
-
-{Colors.BOLD}Прочее:{Colors.END}
-  exit, quit     - Выйти из программы
-  help           - Показать эту справку
-
-{Colors.YELLOW}💡 Все остальные Git команды (add, commit, branch, checkout)
-   выполняйте в обычной командной строке (CMD){Colors.END}
-"""
-        print(help_text)
-
-    def _cmd_alias(self, args):
-        try:
-            if len(args) > 2:
-                self.alias[args[1]] = " ".join(args[2:])
-                config = {"alias": self.alias}
-                CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-                CONFIG_FILE.write_text(json.dumps(config, indent=2), encoding='utf-8')
-                print(f"{Colors.GREEN}✅ Alias создан: {args[1]} -> {self.alias[args[1]]}{Colors.END}")
-            elif len(args) > 1:
-                if args[1] in self.alias:
-                    print(self.alias[args[1]])
-                else:
-                    print(f"{Colors.RED}❌ Alias не найден{Colors.END}")
-            else:
-                if self.alias:
-                    for name, cmd in self.alias.items():
-                        print(f"  {name} -> {cmd}")
-                else:
-                    print("ℹ️ Нет alias")
-        except Exception as e:
-            print(f"{Colors.RED}❌ Ошибка alias: {e}{Colors.END}")
-
-    def _cmd_git(self, args):
-        try:
-            code, out, err = self._safe_run_git(args[1:] if len(args) > 1 else [])
-            if out:
-                print(out)
-            if err:
-                print(f"{Colors.RED}{err}{Colors.END}")
-            return code == 0
-        except Exception as e:
-            print(f"{Colors.RED}❌ Ошибка git: {e}{Colors.END}")
-            return False
-
-    def execute_command(self, cmd: str) -> bool:
-        try:
-            cmd = cmd.strip()
-            if not cmd:
-                return True
-
-            parts = cmd.split()
-
-            if parts[0] in self.alias:
-                cmd = self.alias[parts[0]] + " " + " ".join(parts[1:])
-                parts = cmd.split()
-
-            if parts[0] in ["exit", "quit", "q"]:
-                print("👋 До свидания!")
-                return False
-
-            if parts[0] == "cd":
-                self._cmd_cd(parts)
-            elif parts[0] == "pwd":
-                self._cmd_pwd(parts)
-            elif parts[0] in ["ls", "dir"]:
-                self._cmd_ls(parts)
-            elif parts[0] == "config":
-                self._cmd_config(parts)
-            elif parts[0] == "push":
-                self._cmd_push(parts)
-            elif parts[0] in ["help", "?"]:
-                self._cmd_help(parts)
-            elif parts[0] == "alias":
-                self._cmd_alias(parts)
-            elif parts[0] == "git":
-                self._cmd_git(parts)
-            else:
-                try:
-                    code, out, err = self._safe_run_git(parts)
-                    if out:
-                        print(out)
-                    if err:
-                        print(f"{Colors.RED}{err}{Colors.END}")
-                except:
-                    print(f"{Colors.RED}❌ Неизвестная команда: {cmd}{Colors.END}")
-                    print("Введите 'help' для списка команд")
-
-            return True
-
-        except KeyboardInterrupt:
-            raise
-        except Exception as e:
-            print(f"{Colors.RED}❌ Ошибка: {e}{Colors.END}")
-            return True
-
-    def run(self):
-        # Заголовок без лишних символов
-        print(f"""
-{Colors.BOLD}{Colors.HEADER}╔═══════════════════════════════════════════╗
-║     GitShell - Неубиваемая оболочка   ║
-║     Git через pycurl                  ║
-╚═══════════════════════════════════════════╝{Colors.END}
-
-💡 Введите 'help' для списка команд
-""")
-
-        if self.token:
-            print(f"{Colors.GREEN}🔑 Токен загружен: {self.token[:10]}...{Colors.END}")
+        if method.upper() == "CONNECT":
+            self._handle_connect(client, target, reader)
         else:
-            print(f"{Colors.YELLOW}⚠️  Токен не найден. Используйте: config token <токен>{Colors.END}")
+            self._handle_forward(client, method, target, version, headers, reader)
 
-        if not PYCURL_AVAILABLE:
-            print(f"{Colors.YELLOW}⚠️  PyCurl не установлен. Push через pycurl не работает.{Colors.END}")
+    def _handle_connect(self, client, target, reader):
+        host, port = split_host_port(target, 443)
+        if not host:
+            self._send_error(client, 400, "Malformed CONNECT target")
+            return
+        try:
+            tunnel = open_tunnel(self.server.config, host, port)
+        except TunnelError as exc:
+            LOG.warning("CONNECT %s:%s failed: %s", host, port, exc)
+            self._send_error(client, 502, f"Upstream tunnel failed: {exc}")
+            return
 
-        print()
+        LOG.info("CONNECT %s:%s", host, port)
+        try:
+            client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            leftover = reader.pending()
+            if leftover:
+                tunnel.sendall(leftover)
+            relay(client, tunnel.sock, self.server.config.get("idle_timeout", 600))
+        except OSError:
+            pass
+        finally:
+            tunnel.close()
 
-        while self.running:
-            try:
-                prompt = self._safe_get_prompt()
-                cmd = self._safe_get_input(prompt)
+    def _handle_forward(self, client, method, target, version, headers, reader):
+        parsed = urlsplit(target)
+        if not parsed.hostname:
+            self._send_error(client, 400, "Proxy requires an absolute URI")
+            return
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
 
-                if not self.execute_command(cmd):
-                    break
+        try:
+            tunnel = open_tunnel(self.server.config, host, port)
+        except TunnelError as exc:
+            LOG.warning("%s %s:%s failed: %s", method, host, port, exc)
+            self._send_error(client, 502, f"Upstream tunnel failed: {exc}")
+            return
 
-            except KeyboardInterrupt:
-                print("\n")
-                continue
-            except EOFError:
-                print("\n👋 До свидания!")
-                break
-            except Exception as e:
-                print(f"{Colors.RED}❌ Критическая ошибка: {e}{Colors.END}")
-                print("   Программа продолжает работу...")
+        LOG.info("%s %s:%s%s", method, host, port, path)
+        try:
+            out = bytearray()
+            out += f"{method} {path} {version}\r\n".encode("latin-1")
+            for line in headers:
+                if line.lower().startswith(b"proxy-connection:"):
+                    continue
+                out += line
+            tunnel.sendall(bytes(out))
+            leftover = reader.pending()
+            if leftover:
+                tunnel.sendall(leftover)
+            relay(client, tunnel.sock, self.server.config.get("idle_timeout", 600))
+        except OSError:
+            pass
+        finally:
+            tunnel.close()
 
-        self._safe_save_history()
+    @staticmethod
+    def _send_error(client, code, message):
+        body = message.encode("utf-8", "replace")
+        reason = REASONS.get(code, "Error")
+        head = (
+            f"HTTP/1.1 {code} {reason}\r\n"
+            f"Content-Type: text/plain; charset=utf-8\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"Connection: close\r\n\r\n"
+        ).encode("latin-1")
+        try:
+            client.sendall(head + body)
+        except OSError:
+            pass
 
 
-# ============================================================
-# ТОЧКА ВХОДА
-# ============================================================
+class ThreadingProxyServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+    request_queue_size = 64
 
-def main():
+    def __init__(self, address, config):
+        self.config = config
+        super().__init__(address, ProxyHandler)
+
+    def handle_error(self, request, client_address):
+        exc_type = sys.exc_info()[0]
+        if exc_type is not None and issubclass(exc_type, (ConnectionError, socket.timeout, OSError)):
+            LOG.debug("connection from %s ended", client_address)
+        else:
+            LOG.exception("error while handling %s", client_address)
+
+
+def _http_get(url, proxy=None, verify=False, timeout=25):
+    if pycurl is None:
+        raise RuntimeError("pycurl is not installed")
+    buffer = io.BytesIO()
+    curl = pycurl.Curl()
     try:
-        shell = GitShell()
-        shell.run()
+        curl.setopt(pycurl.URL, url)
+        curl.setopt(pycurl.WRITEDATA, buffer)
+        curl.setopt(pycurl.NOPROGRESS, 1)
+        curl.setopt(pycurl.TIMEOUT, timeout)
+        curl.setopt(pycurl.CONNECTTIMEOUT, timeout)
+        curl.setopt(pycurl.USERAGENT, f"{APP_NAME}/{VERSION}")
+        curl.setopt(pycurl.FOLLOWLOCATION, 1)
+        if proxy:
+            curl.setopt(pycurl.PROXY, proxy)
+        if not verify:
+            curl.setopt(pycurl.SSL_VERIFYPEER, 0)
+            curl.setopt(pycurl.SSL_VERIFYHOST, 0)
+        curl.perform()
+        return curl.getinfo(pycurl.RESPONSE_CODE), buffer.getvalue()
+    finally:
+        curl.close()
+
+
+def _git_ls_remote(proxy: str) -> str:
+    command = [
+        "git",
+        "-c", f"http.proxy={proxy}",
+        "-c", f"https.proxy={proxy}",
+        "ls-remote",
+        "https://github.com/octocat/Hello-World.git",
+        "HEAD",
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=90)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(detail.splitlines()[-1] if detail else f"exit code {result.returncode}")
+    first = result.stdout.strip().splitlines()
+    return first[0] if first else "no refs returned"
+
+
+def load_config(args) -> dict:
+    config = dict(DEFAULT_CONFIG)
+    if CONFIG_PATH.exists():
+        try:
+            stored = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(stored, dict):
+                config.update(stored)
+        except (OSError, ValueError):
+            LOG.warning("could not read %s, using defaults", CONFIG_PATH)
+
+    env_map = {
+        "GITPROXY_UPSTREAM": "upstream_proxy",
+        "GITPROXY_LISTEN": "listen_host",
+        "GITPROXY_PORT": "listen_port",
+        "GITPROXY_USER": "proxy_user",
+    }
+    for env_name, key in env_map.items():
+        value = os.environ.get(env_name)
+        if value:
+            config[key] = value
+
+    if getattr(args, "proxy", None):
+        config["upstream_proxy"] = args.proxy
+    if getattr(args, "listen", None):
+        config["listen_host"] = args.listen
+    if getattr(args, "port", None):
+        config["listen_port"] = args.port
+    if getattr(args, "proxy_auth", None):
+        config["proxy_user"] = args.proxy_auth
+    if getattr(args, "verify_upstream", None) is not None:
+        config["verify_upstream"] = args.verify_upstream
+
+    try:
+        config["listen_port"] = int(config["listen_port"])
+    except (TypeError, ValueError):
+        config["listen_port"] = DEFAULT_CONFIG["listen_port"]
+    return config
+
+
+def cmd_run(config: dict) -> int:
+    try:
+        server = ThreadingProxyServer((config["listen_host"], config["listen_port"]), config)
+    except OSError as exc:
+        LOG.error("cannot bind %s:%s - %s", config["listen_host"], config["listen_port"], exc)
+        return 1
+
+    port = server.server_address[1]
+    local_url = f"http://{config['listen_host']}:{port}"
+    LOG.info("local proxy listening on %s", local_url)
+    LOG.info("upstream proxy: %s", build_proxy_url(config))
+    LOG.info("point git here:  %s install   (or set http.proxy / https.proxy to %s)", _prog(), local_url)
+    LOG.info("press Ctrl+C to stop")
+    try:
+        server.serve_forever()
     except KeyboardInterrupt:
-        print("\n👋 До свидания!")
-    except Exception as e:
-        print(f"{Colors.RED}❌ Ошибка запуска: {e}{Colors.END}")
-        traceback.print_exc()
-        input("\nНажмите Enter для выхода...")
+        LOG.info("stopping")
+    finally:
+        server.shutdown()
+        server.server_close()
+    return 0
+
+
+def cmd_install(args, config: dict) -> int:
+    local_url = f"http://{config['listen_host']}:{config['listen_port']}"
+    scope_flag = "--local" if args.scope == "local" else "--global"
+    pairs = [("http.proxy", local_url), ("https.proxy", local_url)]
+    if getattr(args, "insecure_git", False):
+        pairs.append(("http.sslVerify", "false"))
+
+    for key, value in pairs:
+        result = subprocess.run(["git", "config", scope_flag, key, value], capture_output=True, text=True)
+        if result.returncode != 0:
+            LOG.error("failed to set %s: %s", key, result.stderr.strip())
+            return 1
+        LOG.info("git config %s %s = %s", scope_flag, key, value)
+
+    LOG.info("start the proxy with: %s run", _prog())
+    return 0
+
+
+def cmd_uninstall(args, config: dict) -> int:
+    scope_flag = "--local" if args.scope == "local" else "--global"
+    for key in ("http.proxy", "https.proxy"):
+        result = subprocess.run(["git", "config", scope_flag, "--unset", key], capture_output=True, text=True)
+        if result.returncode == 0:
+            LOG.info("removed git config %s %s", scope_flag, key)
+    return 0
+
+
+def cmd_status(args, config: dict) -> int:
+    source = str(CONFIG_PATH) if CONFIG_PATH.exists() else "(built-in defaults)"
+    print(f"config file    : {source}")
+    print(f"upstream proxy : {build_proxy_url(config)}")
+    print(f"local listen   : {config['listen_host']}:{config['listen_port']}")
+    print(f"pycurl         : {pycurl.version if pycurl else 'not installed'}")
+    for scope_name, scope_flag in (("global", "--global"), ("local", "--local")):
+        for key in ("http.proxy", "https.proxy"):
+            result = subprocess.run(["git", "config", scope_flag, "--get", key], capture_output=True, text=True)
+            value = result.stdout.strip()
+            if value:
+                print(f"git {scope_name:<6}   : {key} = {value}")
+    return 0
+
+
+class _EchoHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        try:
+            data = self.request.recv(65536)
+            if data:
+                self.request.sendall(b"ECHO:" + data)
+        except OSError:
+            pass
+
+
+class _OriginHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        reader = BufferedSocket(self.request)
+        try:
+            reader.readline()
+            reader.read_headers()
+            reader.pending()
+        except OSError:
+            return
+        try:
+            self.request.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+        except OSError:
+            pass
+
+
+class _DirectTunnel:
+    def __init__(self, sock):
+        self.sock = sock
+
+    def sendall(self, data):
+        self.sock.sendall(data)
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def _direct_open_tunnel(config, host, port):
+    return _DirectTunnel(socket.create_connection((host, port), timeout=5))
+
+
+def _serve(server_cls, handler):
+    server = server_cls(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def cmd_selftest(config: dict) -> int:
+    global open_tunnel
+    failures = 0
+
+    def check(name, func):
+        nonlocal failures
+        try:
+            detail = func()
+            LOG.info("[ OK ] %s%s", name, f" - {detail}" if detail else "")
+        except Exception as exc:
+            failures += 1
+            LOG.error("[FAIL] %s - %s", name, exc)
+
+    echo = _serve(socketserver.ThreadingTCPServer, _EchoHandler)
+    origin = _serve(socketserver.ThreadingTCPServer, _OriginHandler)
+    proxy = ThreadingProxyServer((config["listen_host"], 0), config)
+    threading.Thread(target=proxy.serve_forever, daemon=True).start()
+    proxy_port = proxy.server_address[1]
+
+    original_open_tunnel = open_tunnel
+    open_tunnel = _direct_open_tunnel
+    try:
+        def connect_tunnel():
+            client = socket.create_connection(("127.0.0.1", proxy_port), timeout=5)
+            try:
+                target = f"127.0.0.1:{echo.server_address[1]}"
+                client.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
+                reader = BufferedSocket(client)
+                status = reader.readline()
+                if b" 200 " not in status:
+                    raise RuntimeError(f"status {status!r}")
+                reader.read_headers()
+                client.sendall(b"ping")
+                data = client.recv(4096)
+                if data != b"ECHO:ping":
+                    raise RuntimeError(f"echo mismatch: {data!r}")
+                return "CONNECT -> raw tunnel -> echo"
+            finally:
+                client.close()
+        check("CONNECT tunneling", connect_tunnel)
+
+        def forward():
+            client = socket.create_connection(("127.0.0.1", proxy_port), timeout=5)
+            try:
+                target = f"http://127.0.0.1:{origin.server_address[1]}/x"
+                client.sendall(
+                    f"GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nProxy-Connection: keep-alive\r\n\r\n".encode()
+                )
+                data = b""
+                while b"\r\n\r\n" not in data and len(data) < 4096:
+                    chunk = client.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                if not data.startswith(b"HTTP/1.1 200"):
+                    raise RuntimeError(f"unexpected response {data[:40]!r}")
+                return "absolute-URI request rewritten and forwarded"
+            finally:
+                client.close()
+        check("plain HTTP forwarding", forward)
+    finally:
+        open_tunnel = original_open_tunnel
+        proxy.shutdown()
+        proxy.server_close()
+        echo.shutdown()
+        echo.server_close()
+        origin.shutdown()
+        origin.server_close()
+
+    if failures:
+        LOG.error("%d self-test(s) failed", failures)
+        return 1
+    LOG.info("self-test passed (no network or pycurl required)")
+    return 0
+
+
+def cmd_test(args, config: dict) -> int:
+    failures = 0
+
+    def check(name, func):
+        nonlocal failures
+        try:
+            detail = func()
+            LOG.info("[ OK ] %s%s", name, f" - {detail}" if detail else "")
+        except Exception as exc:
+            failures += 1
+            LOG.error("[FAIL] %s - %s", name, exc)
+
+    LOG.info("upstream proxy : %s", build_proxy_url(config))
+    LOG.info("local listen   : %s:%s", config["listen_host"], config["listen_port"])
+
+    check("pycurl available", lambda: pycurl.version if pycurl else _raise("pycurl is not installed"))
+
+    def upstream():
+        code, body = _http_get("https://api.github.com/zen", proxy=build_proxy_url(config))
+        return f"HTTP {code}, {len(body)} bytes"
+    check("internet via upstream proxy", upstream)
+
+    def tunnel():
+        t = open_tunnel(config, "github.com", 443)
+        try:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            tls = context.wrap_socket(t.sock, server_hostname="github.com")
+            tls.sendall(b"GET / HTTP/1.0\r\nHost: github.com\r\n\r\n")
+            data = tls.recv(64)
+            if not data.startswith(b"HTTP/"):
+                raise RuntimeError(f"unexpected response {data[:32]!r}")
+            return data.splitlines()[0].decode("latin-1")
+        finally:
+            t.close()
+    check("raw tunnel github.com:443", tunnel)
+
+    server = None
+    try:
+        server = ThreadingProxyServer((config["listen_host"], config["listen_port"]), config)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        local_url = f"http://127.0.0.1:{port}"
+
+        def through_local():
+            code, body = _http_get("https://api.github.com/zen", proxy=local_url)
+            return f"HTTP {code}, {len(body)} bytes"
+        check("internet via local proxy", through_local)
+
+        check("git ls-remote via local proxy", lambda: _git_ls_remote(local_url))
+        check("git ls-remote via upstream proxy", lambda: _git_ls_remote(build_proxy_url(config)))
+    finally:
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+
+    if failures:
+        LOG.error("%d check(s) failed", failures)
+        return 1
+    LOG.info("all checks passed")
+    return 0
+
+
+def _raise(message):
+    raise RuntimeError(message)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=_prog(),
+        description="Local HTTP proxy that tunnels Git through a corporate proxy using pycurl.",
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    parser.add_argument("-v", "--verbose", action="store_true", help="enable debug logging")
+    parser.add_argument("--log-level", default="INFO", help="logging level (default INFO)")
+
+    def add_common(sub):
+        sub.add_argument("--proxy", help="upstream proxy URL")
+        sub.add_argument("--listen", help="local listen address (default 127.0.0.1)")
+        sub.add_argument("--port", type=int, help="local listen port (default 3129)")
+        sub.add_argument("--proxy-auth", dest="proxy_auth", metavar="USER:PASS", help="upstream proxy credentials")
+        sub.add_argument("--verify-upstream", dest="verify_upstream", action="store_true", default=None,
+                         help="verify TLS certificates on the upstream side")
+        sub.add_argument("--no-verify-upstream", dest="verify_upstream", action="store_false",
+                         help="do not verify upstream certificates")
+
+    subparsers = parser.add_subparsers(dest="command")
+    add_common(subparsers.add_parser("run", help="start the local proxy"))
+
+    install = subparsers.add_parser("install", help="point git at the local proxy")
+    add_common(install)
+    install.add_argument("--scope", choices=("global", "local"), default="global")
+    install.add_argument("--insecure-git", action="store_true", help="also set http.sslVerify=false")
+
+    uninstall = subparsers.add_parser("uninstall", help="remove git proxy settings")
+    uninstall.add_argument("--scope", choices=("global", "local"), default="global")
+
+    add_common(subparsers.add_parser("test", help="run connectivity checks"))
+    subparsers.add_parser("selftest", help="offline test of the proxy logic (no network)")
+    subparsers.add_parser("status", help="show effective configuration")
+
+    return parser
+
+
+def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    commands = {"run", "install", "uninstall", "test", "selftest", "status"}
+    informational = {"-h", "--help", "--version"}
+    if not informational.intersection(argv) and not commands.intersection(argv):
+        argv.insert(0, "run")
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    level = logging.DEBUG if args.verbose else getattr(logging, str(args.log_level).upper(), logging.INFO)
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S")
+
+    config = load_config(args)
+    command = args.command or "run"
+
+    if command == "run":
+        return cmd_run(config)
+    if command == "install":
+        return cmd_install(args, config)
+    if command == "uninstall":
+        return cmd_uninstall(args, config)
+    if command == "test":
+        return cmd_test(args, config)
+    if command == "selftest":
+        return cmd_selftest(config)
+    if command == "status":
+        return cmd_status(args, config)
+
+    parser.print_help()
+    return 2
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
